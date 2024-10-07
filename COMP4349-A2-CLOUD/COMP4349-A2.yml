@@ -1,0 +1,301 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for deploying an EC2 instance and an RDS instance for the Cafe Web application
+
+Parameters:
+  ExistingVPC:
+    Type: AWS::EC2::VPC::Id
+    Description: v
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: s
+  WebAppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: s
+  APIAppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: s
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet::Id
+    Description: s
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet::Id
+    Description: s
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet::Id
+    Description: s
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet::Id
+    Description: s
+  WebAppAMI:
+    Type: String
+    Description: ami-0171bf169079083c4
+  APIAppAMI:
+    Type: String
+    Description: ami-04349e6afa00f4494
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    AllowedValues: [t2.micro, t3.micro]
+    Description: EC2 instance type
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: web
+  DBUsername:
+    Type: String
+    Description: admin
+  DBPassword:
+    Type: String
+    NoEcho: true
+    Description: password
+  
+
+Resources:
+  # Security Group for Web App
+  APISecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref ExistingVPC
+      GroupDescription: Enable API access on port 5000 and SSH from bastion
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5000
+          ToPort: 5000
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+      Tags:
+        - Key: Name
+          Value: cafe-api-sg 
+  
+  LoadBalancerSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties: 
+      GroupDescription: "Security group for Load Balancer allowing HTTP from anywhere"
+      VpcId: !Ref ExistingVPC
+      SecurityGroupIngress:
+        - IpProtocol: "tcp"
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0" # Allow HTTP from anywhere
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          FromPort: 0
+          ToPort: 0
+          CidrIp: "0.0.0.0/0" # Allow all outbound traffic
+  
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref ExistingVPC
+      GroupDescription: Enable MySQL access from web and API instances
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref WebAppSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref APIAppSecurityGroup
+      Tags:
+        - Key: Name
+          Value: cafe-database-sg
+
+
+  # Launch Configuration for Web App
+  WebAppLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: "ami-0171bf169079083c4"
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      SecurityGroups:
+        - !Ref WebAppSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Install Apache Web Server and PHP
+          yum install -y httpd mysql
+          amazon-linux-extras install -y php7.2
+          # Download and install the AWS SDK for PHP
+          wget https://github.com/aws/aws-sdk-php/releases/download/3.62.3/aws.zip
+          unzip aws -d /var/www/html
+          # Turn on web server
+          chkconfig httpd on
+          service httpd start
+
+  # Auto Scaling Group for Web App
+  WebAppAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      LaunchConfigurationName: !Ref WebAppLaunchConfiguration
+      MinSize: 2
+      MaxSize: 6
+      DesiredCapacity: 2
+      TargetGroupARNs:
+        - !Ref WebAppTargetGroup
+      Tags:
+        - Key: Name
+          Value: cafe-webapp-asg
+          PropagateAtLaunch: true
+
+  # Load Balancer for Web App
+  WebAppLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: webapp-loadbalancer
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      Scheme: internet-facing
+
+  # Target Group for Web App
+  WebAppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: webapp-targetgroup
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref ExistingVPC
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: "80"
+      HealthCheckPath: /cafe/index.php
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      TargetType: instance
+  
+  WebAppTargetTrackingScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WebAppAutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 50.0
+
+  # Listener for Web App Load Balancer
+  WebAppListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebAppTargetGroup
+      LoadBalancerArn: !Ref WebAppLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  
+  # Launch Configuration for API Endpoints
+  APILaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: "ami-04349e6afa00f4494"
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      SecurityGroups:
+        - !Ref APIAppSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Update and install necessary packages
+          yum update -y
+          yum install -y python3-pip
+          pip3 install flask requests mysql-connector-python
+
+          # Install Apache Web Server and PHP
+          yum install -y httpd mysql
+          amazon-linux-extras install -y php7.2
+          # Download and install the AWS SDK for PHP
+          wget https://github.com/aws/aws-sdk-php/releases/download/3.62.3/aws.zip
+          unzip aws -d /var/www/html
+          # Turn on web server
+          chkconfig httpd on
+          service httpd start
+
+          # Navigate to the directory where app.py is located
+          cd /home/ec2-user/cafe_api_release
+
+          # Make sure the app.py is executable
+          chmod +x app.py
+
+          # Run the Flask application
+          /usr/bin/python3 /home/ec2-user/cafe_api_release/app.py > app.log 2>&1 &
+
+  # Auto Scaling Group for API Endpoints
+  APIAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      LaunchConfigurationName: !Ref APILaunchConfiguration
+      MinSize: 2
+      MaxSize: 2
+      DesiredCapacity: 2
+      TargetGroupARNs:
+        - !Ref APITargetGroup
+      Tags:
+        - Key: Name
+          Value: cafe-api-asg
+          PropagateAtLaunch: true
+
+  # Load Balancer for API Endpoints
+  APILoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: api-loadbalancer
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref APISecurityGroup
+      Scheme: internet-facing
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+
+  # Target Group for API Endpoints
+  APITargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: api-targetgroup
+      Port: 5000
+      Protocol: HTTP
+      VpcId: !Ref ExistingVPC
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: "5000"
+      HealthCheckPath: /products
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 5
+      TargetType: instance
+
+  # Listener for API Load Balancer
+  APIListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref APITargetGroup
+      LoadBalancerArn: !Ref APILoadBalancer
+      Port: 5000
+      Protocol: HTTP
+
+  
+
+Outputs:
+  WebAppLoadBalancerDNSName:
+    Description: DNS name of the web application load balancer
+    Value: !GetAtt WebAppLoadBalancer.DNSName
+
+  APILoadBalancerDNSName:
+    Description: DNS name of the API load balancer
+    Value: !GetAtt APILoadBalancer.DNSName
+    
